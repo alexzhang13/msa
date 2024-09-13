@@ -8,16 +8,59 @@ from functools import partial
 from typing import Dict, Callable, List, Tuple, Sequence, Union
 from functools import partialmethod
 import math
+import os
 
 import triton
 import triton.language as tl
 
 from utils import flatten_final_dims, Linear, LinearNoBias
+from msa import MSAPairWeightedAveraging
 
 def nearest_pow2(n: int):
     power = math.ceil(math.log2(n))
     next_power_of_two = 2 ** power
     return next_power_of_two
+
+@triton.jit
+def SanityCheck(
+    v_si_ptr, b_ij_ptr, g_si_ptr, output_ptr,
+    C_hidden, N_head,
+    C_LEN_POW2: tl.constexpr,
+    RES_LEN_POW2: tl.constexpr,
+    SEQ_LEN: tl.constexpr, RES_LEN: tl.constexpr, 
+    BLOCK_SIZE_ROW: tl.constexpr,
+    BLOCK_SIZE_SEQ: tl.constexpr,
+):
+    # Compute the program ID and starting index
+    pid_z = tl.program_id(0)
+    pid_h = tl.program_id(1)
+    pid_i = tl.program_id(2)
+    
+    # Compute offsets
+    s = 0
+    z_off = pid_z.to(tl.int64)
+    h_off = pid_h.to(tl.int64)
+    i_off = pid_i.to(tl.int64) * BLOCK_SIZE_ROW
+    offs_i = i_off + tl.arange(0, BLOCK_SIZE_ROW)
+    offs_j = tl.arange(0, RES_LEN_POW2)
+    offs_c = tl.arange(0, C_LEN_POW2)
+    offs_s = s + tl.arange(0, BLOCK_SIZE_SEQ)
+    
+    for ch in range(0, C_hidden, 1):
+        si_off = (z_off * SEQ_LEN * RES_LEN * N_head * C_hidden) + \
+                     (offs_s[:, None] * RES_LEN * N_head * C_hidden) + \
+                     (offs_i[None, :] * N_head * C_hidden) + \
+                     (h_off * C_hidden) + \
+                     (ch)
+        si_mask = ((offs_s < SEQ_LEN)[:, None]) & ((offs_i < RES_LEN)[None, :])
+
+        # Load in v_{i,j}
+        g = tl.load(g_si_ptr + si_off, si_mask, 0)
+        g = tl.sigmoid(g)
+        out = tl.zeros_like(g)
+
+        out = tl.dot(g, g, acc=out, out_dtype=out.dtype)
+        tl.store(output_ptr + si_off, out, si_mask)
 
 @triton.jit
 def MSAFwdFused(
@@ -38,55 +81,58 @@ def MSAFwdFused(
     h_off = pid_h.to(tl.int64)
     i_off = pid_i.to(tl.int64) * BLOCK_SIZE_ROW
     offs_i = i_off + tl.arange(0, BLOCK_SIZE_ROW)
+    offs_j = tl.arange(0, RES_LEN_POW2)
     offs_c = tl.arange(0, C_LEN_POW2)
     
     # Load in b weight i:i+BLOCK_SIZE_ROW and compute softmax
-    offs_j = tl.arange(0, RES_LEN_POW2)
-    b_off = (offs_i[:, None] * RES_LEN * N_head) + \
+
+    b_offs = (offs_i[:, None] * RES_LEN * N_head) + \
             (offs_j[None, :] * N_head) + \
             (h_off)
+    
     ij_mask = ((offs_i < RES_LEN)[:, None]) & ((offs_j < RES_LEN)[None, :])
     
-    b = tl.load(b_ij_ptr + b_off, ij_mask, 0)
+    b = tl.load(b_ij_ptr + b_offs, ij_mask, 0)
     
-    # Compute softmax of row (assuming all loaded in)
+    # Compute softmax of row (assuming all loaded in, should be cheap since w is small)
     row_minus_max = b - tl.max(b, axis=0)
     numerator = tl.exp(row_minus_max)
     denominator = tl.sum(numerator, axis=0)
     w = numerator / denominator
-    w = tl.broadcast_to(tl.trans(w, 1, 0).expand_dims(0), BLOCK_SIZE_SEQ, RES_LEN, BLOCK_SIZE_ROW)
     
     # Compute output
     for s in range(0, SEQ_LEN, BLOCK_SIZE_SEQ):
         # Offsets for {s,i} indices
-        offs_s = s + tl.arange(0, BLOCK_SIZE_SEQ)
-        si_off = (z_off * SEQ_LEN * RES_LEN * N_head * C_hidden) + \
-                 (offs_s[:, None, None] * RES_LEN * N_head * C_hidden) + \
-                 (offs_i[None, :, None] * N_head * C_hidden) + \
-                 (h_off * C_hidden) + \
-                 (offs_c[None, None, :])
-        si_mask = ((offs_s < SEQ_LEN)[:, None, None]) & ((offs_i < RES_LEN)[None, :, None]) & ((offs_c < C_hidden)[None, None, :])
         
-        # Load in g_{s,i}
-        g = tl.load(g_si_ptr + si_off, si_mask, 0)
-        g = tl.sigmoid(g)
-        
-        sj_off = (z_off * N_head * SEQ_LEN * RES_LEN * C_hidden) + \
-                    (offs_s[:, None, None] * RES_LEN * N_head * C_hidden) + \
-                    (offs_j[None, :, None] * N_head * C_hidden) + \
-                    (h_off * C_hidden) + \
-                    (offs_c[None, None, :])
-        sj_mask = ((offs_s < SEQ_LEN)[:, None, None]) & ((offs_j < RES_LEN)[None, :, None]) & ((offs_c < C_hidden)[None, None, :])
-        
-        # Load in v_{i,j}
-        v = tl.load(v_si_ptr + sj_off, sj_mask, 0)
-        
-        v = tl.trans(v, 0, 2, 1)
-        vw = tl.trans(tl.dot(v, w), 0, 2, 1)
+        for ch in range(0, C_hidden, 1):
+            offs_s = s + tl.arange(0, BLOCK_SIZE_SEQ)
+            si_off = (z_off * SEQ_LEN * RES_LEN * N_head * C_hidden) + \
+                     (offs_s[None, :] * RES_LEN * N_head * C_hidden) + \
+                     (offs_i[:, None] * N_head * C_hidden) + \
+                     (h_off * C_hidden) + \
+                     (ch)
+            si_mask = ((offs_s < SEQ_LEN)[None, :]) & ((offs_i < RES_LEN)[:, None])
 
-        # Element-wise product of output
-        out = vw # g * vw
-        tl.store(output_ptr + si_off, out, si_mask)
+            # Load in g_{s,i} transposed
+            g = tl.load(g_si_ptr + si_off, si_mask, 0)
+            g = tl.sigmoid(g)
+
+            sj_off = (z_off * SEQ_LEN * RES_LEN * N_head * C_hidden) + \
+                     (offs_s[None, :] * RES_LEN * N_head * C_hidden) + \
+                     (offs_j[:, None] * N_head * C_hidden) + \
+                     (h_off * C_hidden) + \
+                     (ch)
+            sj_mask = ((offs_s < SEQ_LEN)[None, :]) & ((offs_j < RES_LEN)[:, None])
+
+            # Load in v_{s,j} transposed
+            v = tl.load(v_si_ptr + sj_off, sj_mask, 0)
+            
+            # W has shape I x J
+            vw = tl.dot(w, v) # (I x J) x (J x S) = I x S
+
+            # Element-wise product of output
+            out = g * vw
+            tl.store(output_ptr + si_off, out, si_mask)
 
 
 class _MSAWeightedAveragingFused(torch.autograd.Function):
@@ -105,19 +151,19 @@ class _MSAWeightedAveragingFused(torch.autograd.Function):
         n_res_pow2 = nearest_pow2(n_res)
         c_hidden_pow2 = nearest_pow2(C_hidden)
 
-        # output = torch.empty((N, S, C), device=m_si.device, dtype=m_si.dtype)
-
         grid = (
             n_batches,
             no_heads,
             triton.cdiv(n_res, BLOCK_SIZE_ROW),
         )
+        
+        print('Grid', grid)
 
         MSAFwdFused[grid](
             v, b, g, out,
             C_hidden, no_heads,
-            c_hidden_pow2,
-            n_res_pow2, n_seq, n_res,
+            c_hidden_pow2, n_res_pow2, 
+            n_seq, n_res,
             BLOCK_SIZE_ROW,
             BLOCK_SIZE_SEQ,
         )
@@ -195,8 +241,7 @@ class MSAPairWeightedAveragingFused(nn.Module):
         b = self.proj_pair_bias(z)  # (*, res, res, no_heads)
         g = self.to_gamma(m_ln)  # (*, seq, res, heads, c_hidden)
 
-        print('g shape', g.shape)
-        print('g', g)
+        print(flatten_final_dims(v, 2))
         
         del m_ln
 
@@ -208,29 +253,37 @@ class MSAPairWeightedAveragingFused(nn.Module):
 
         if msa_mask is not None:
             v = v * msa_mask.unsqueeze(-1).unsqueeze(-1)
-        print('b shape', b.shape)
         
         # Weighted average with gating
+        # v = flatten_final_dims(v, 2)
         o = MSAWeightedAveragingFused(v, b, g)
         
-        print('out', o)
-
         # Output projection
         output = self.output_proj(o)  # (*, seq, res, c_msa)
         return output
     
 if __name__ == "__main__":
-    N_seq = 3
-    N_res = 128 # 384
+    os.environ["TRITON_INTERPRET"] = "1"
+    
+    N_seq = 16
+    N_res = 384
     B = 1
-    C_m = 64
+    C_m = 32
     C_z = 128
     C_hidden = 32
-    no_heads = 8
+    no_heads = 2
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
     m = torch.randn((B, N_seq, N_res, C_m), device=device)
     z = torch.randn((B, N_res, N_res, C_z), device=device)
+    
+    msa_original = MSAPairWeightedAveraging(
+            c_msa=C_m,
+            c_z=C_z,
+            c_hidden=C_hidden,
+            no_heads=no_heads
+          ).to(device)
+    o_o = msa_original(m, z)
     
     msa = MSAPairWeightedAveragingFused(
             c_msa=C_m,
@@ -240,4 +293,8 @@ if __name__ == "__main__":
           ).to(device)
     
     o = msa(m, z)
+    
+    print(o)
+    print('orig', o_o)
+    print('diff', torch.mean(o - o_o))
     # print('projected', o)
