@@ -7,89 +7,8 @@ from torch.nn import LayerNorm
 from functools import partial
 from typing import Dict, Callable, List, Tuple, Sequence, Union
 from functools import partialmethod
-
-def flatten_final_dims(t: torch.Tensor, no_dims: int):
-    return t.reshape(t.shape[:-no_dims] + (-1,))
-
-class Linear(nn.Linear):
-    """
-    A Linear layer with built-in nonstandard initializations. Called just
-    like torch.nn.Linear.
-
-    Implements the initializers in 1.11.4, plus some additional ones found
-    in the code.
-    """
-
-    def __init__(
-            self,
-            in_dim: int,
-            out_dim: int,
-            bias: bool = True,
-            init: str = "default",
-            init_fn: Optional[Callable[[torch.Tensor, torch.Tensor], None]] = None,
-            precision=None
-    ):
-        """
-        Args:
-            in_dim:
-                The final dimension of inputs to the layer
-            out_dim:
-                The final dimension of layer outputs
-            bias:
-                Whether to learn an additive bias. True by default
-            init:
-                The initializer to use. Choose from:
-
-                "default": LeCun fan-in truncated normal initialization
-                "relu": He initialization w/ truncated normal distribution
-                "glorot": Fan-average Glorot uniform initialization
-                "gating": Weights=0, Bias=1
-                "normal": Normal initialization with std=1/sqrt(fan_in)
-                "final": Weights=0, Bias=0
-
-                Overridden by init_fn if the latter is not None.
-            init_fn:
-                A custom initializer taking weight and bias as inputs.
-                Overrides init if not None.
-        """
-        super(Linear, self).__init__(in_dim, out_dim, bias=bias)
-
-        if bias:
-            with torch.no_grad():
-                self.bias.fill_(0)
-
-        # with torch.no_grad():
-        #     if init_fn is not None:
-        #         init_fn(self.weight, self.bias)
-        #     else:
-        #         if init == "default":
-        #             lecun_normal_init_(self.weight)
-        #         elif init == "relu":
-        #             he_normal_init_(self.weight)
-        #         elif init == "glorot":
-        #             glorot_uniform_init_(self.weight)
-        #         elif init == "gating":
-        #             gating_init_(self.weight)
-        #             if bias:
-        #                 self.bias.fill_(1.0)
-        #         elif init == "normal":
-        #             normal_init_(self.weight)
-        #         elif init == "final":
-        #             final_init_(self.weight)
-        #         else:
-        #             raise ValueError("Invalid init string.")
-
-        self.precision = precision
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return F.linear(x, self.weight, self.bias)
-
-
-class LinearNoBias(Linear):
-    """
-        Convenience class for readability.
-    """
-    __init__ = partialmethod(Linear.__init__, bias=False)
+from utils import flatten_final_dims, Linear, LinearNoBias
+from msa_kernel import MSAWeightedAveragingFused
 
 
 class MSAPairWeightedAveraging(nn.Module):
@@ -118,7 +37,6 @@ class MSAPairWeightedAveraging(nn.Module):
         self.to_gamma = nn.Sequential(
             LinearNoBias(c_msa, c_hidden * no_heads, init='gating'),
             split_heads,  # split the heads
-            nn.Sigmoid()
         )
 
         # Pair
@@ -137,7 +55,8 @@ class MSAPairWeightedAveraging(nn.Module):
             m: Tensor,
             z: Tensor,
             msa_mask: Optional[Tensor] = None,
-            z_mask: Optional[Tensor] = None
+            z_mask: Optional[Tensor] = None,
+            use_triton_kernel: bool = False,
     ) -> Tensor:
         """
         Args:
@@ -170,32 +89,50 @@ class MSAPairWeightedAveraging(nn.Module):
 
         if msa_mask is not None:
             v = v * msa_mask.unsqueeze(-1).unsqueeze(-1)
-        new_v_shape = (v.shape[:-4] + (n_seq, n_res, n_res, self.no_heads, self.c_hidden))
-        v = v.unsqueeze(-4).expand(new_v_shape)  # (*, seq, res, res, heads, c_hidden)
+            
+        if use_triton_kernel:
+            o = MSAWeightedAveragingFused(v, b, g, self.inf)
 
-        # Weighted average with gating
-        weights = self.softmax(b)
-        weights = weights.unsqueeze(-4).unsqueeze(-1)  # (*, 1, res, res, heads, 1)
-        o = g * torch.sum(v * weights, dim=-3)  # (*, seq, res, heads, c_hidden)
+            # Output projection
+            output = self.output_proj(o)  # (*, seq, res, c_msa)
+            
+        else:
+            new_v_shape = (v.shape[:-4] + (n_seq, n_res, n_res, self.no_heads, self.c_hidden))
+            v = v.unsqueeze(-4).expand(new_v_shape)  # (*, seq, res, res, heads, c_hidden)
 
-        # Output projection
-        output = self.output_proj(flatten_final_dims(o, 2))  # (*, seq, res, c_hidden * heads)
+            # Weighted average with gating
+            weights = self.softmax(b)
+            weights = weights.unsqueeze(-4).unsqueeze(-1)  # (*, 1, res, res, heads, 1)
+            o = F.sigmoid(g) * torch.sum(v * weights, dim=-3)  # (*, seq, res, heads, c_hidden)
+
+            # Output projection
+            output = self.output_proj(flatten_final_dims(o, 2))  # (*, seq, res, c_hidden * heads)
+        
+        
         return output
     
 
 if __name__ == "__main__":
-    N_seq = 3
-    N_res = 384
+    N_seq = 16
+    N_res = 16
     B = 1
-    C_m = 64
+    C_m = 32
     C_z = 128
+    C_hidden = 32
+    no_heads = 1
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    m = torch.randn((B, N_seq, N_res, C_m))
-    z = torch.randn((B, N_res, N_res, C_z))
+    m = torch.randn((B, N_seq, N_res, C_m), device=device)
+    z = torch.randn((B, N_res, N_res, C_z), device=device)
     
-    msa = MSAPairWeightedAveraging(c_msa=64,
-            c_z=128,
-            c_hidden=32,
-            no_heads=8)
-    o = msa(m, z)
-    print(o)
+    msa = MSAPairWeightedAveraging(
+            c_msa=C_m,
+            c_z=C_z,
+            c_hidden=C_hidden,
+            no_heads=no_heads
+          ).to(device)
+    
+    o_o = msa(m, z, use_triton_kernel=False)
+    o = msa(m, z, use_triton_kernel=True)
+
+    print(torch.mean(torch.abs(o_o - o)))
