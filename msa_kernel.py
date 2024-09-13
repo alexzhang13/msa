@@ -14,7 +14,6 @@ import triton
 import triton.language as tl
 
 from utils import flatten_final_dims, Linear, LinearNoBias
-from msa import MSAPairWeightedAveraging
 
 def nearest_pow2(n: int):
     power = math.ceil(math.log2(n))
@@ -44,7 +43,6 @@ def MSAFwdFused(
     offs_c = tl.arange(0, C_LEN_POW2)
     
     # Load in b weight i:i+BLOCK_SIZE_ROW and compute softmax
-
     b_offs = (z_off * RES_LEN * RES_LEN * N_head) + \
             (offs_i[:, None] * RES_LEN * N_head) + \
             (offs_j[None, :] * N_head) + \
@@ -58,9 +56,9 @@ def MSAFwdFused(
     # log2_e = 1.44269504
     # exp2 = lambda x : tl.exp2(log2_e * x)
     
-    row_minus_max = b - tl.max(b, axis=0, keep_dims=True)
+    row_minus_max = b - tl.max(b, axis=1, keep_dims=True)
     numerator = tl.exp(row_minus_max)
-    denominator = tl.sum(numerator, axis=0, keep_dims=True)
+    denominator = tl.sum(numerator, axis=1, keep_dims=True)
     w = numerator / denominator
     
     # Compute output
@@ -89,8 +87,11 @@ def MSAFwdFused(
 
             # Load in v_{s,j} transposed
             v = tl.load(v_si_ptr + sj_off, sj_mask, 0)
-    
-            vw = tl.dot(w, v)  # (I x J) x (J x S) = I x S
+            
+            # W has shape I x J
+            vw = tl.zeros_like(g)
+            
+            vw = tl.dot(w, v, vw) # (I x J) x (J x S) = I x S
 
             # Element-wise product of output
             out = g * vw
@@ -107,8 +108,7 @@ class _MSAWeightedAveragingFused(torch.autograd.Function):
         
         # allocate output
         out = torch.empty((n_batches, n_seq, n_res, no_heads * C_hidden), device=g.device, dtype=g.dtype)
-        # w_out = torch.empty((n_batches, n_res, n_res, no_heads), device=g.device, dtype=g.dtype) # sanity check
-        
+
         BLOCK_SIZE_ROW = 16
         BLOCK_SIZE_SEQ = 16
         n_res_pow2 = nearest_pow2(n_res)
@@ -119,9 +119,11 @@ class _MSAWeightedAveragingFused(torch.autograd.Function):
             no_heads,
             triton.cdiv(n_res, BLOCK_SIZE_ROW),
         )
+        
+        print('Grid', grid)
 
         MSAFwdFused[grid](
-            v, b, g, out,
+            v, b, g, out, 
             C_hidden, no_heads, inf,
             c_hidden_pow2, n_res_pow2, 
             n_seq, n_res,
@@ -136,119 +138,3 @@ class _MSAWeightedAveragingFused(torch.autograd.Function):
         pass
 
 MSAWeightedAveragingFused = _MSAWeightedAveragingFused.apply
-    
-class MSAPairWeightedAveragingFused(nn.Module):
-    def __init__(
-        self,
-        c_msa: int,
-        c_z: int,
-        c_hidden: int,
-        no_heads: int,
-        inf: float = 1e8
-    ):
-        super(MSAPairWeightedAveragingFused, self).__init__()
-        self.c_msa = c_msa
-        self.c_z = c_z
-        self.c_hidden = c_hidden
-        self.no_heads = no_heads
-        self.inf = inf
-
-        # MSA
-        self.msa_ln = LayerNorm(c_msa)
-        split_heads = nn.Unflatten(dim=-1, unflattened_size=(no_heads, c_hidden))
-        self.msa_proj = nn.Sequential(
-            LinearNoBias(c_msa, c_hidden * no_heads, init='glorot'),
-            split_heads  # split the heads
-        )
-        self.to_gamma = nn.Sequential(
-            LinearNoBias(c_msa, c_hidden * no_heads, init='gating'),
-            split_heads,  # split the heads
-        )
-
-        # Pair
-        self.proj_pair_bias = nn.Sequential(
-            LayerNorm(c_z),
-            LinearNoBias(c_z, no_heads, init="normal")
-        )
-
-        # Output projection
-        self.output_proj = LinearNoBias(no_heads * c_hidden, c_msa, init='final')
-
-    def forward(
-        self,
-        m: Tensor,
-        z: Tensor,
-        msa_mask: Optional[Tensor] = None,
-        z_mask: Optional[Tensor] = None,
-    ) -> Tensor:
-        """
-        Args:
-            m:
-                [*, N_seq, N_res, C_m] MSA embeddings
-            z:
-                [*, N_res, N_res, C_z] pair embeddings
-            msa_mask:
-                [*, N_seq, N_res] MSA mask
-            z_mask:
-                [*, N_res, N_res] pair mask
-        Returns:
-            [*, N_seq, N_res, C_m] updated MSA representation
-        """
-        *_, n_seq, n_res, _ = m.shape
-
-        # Input projections
-        m_ln = self.msa_ln(m)
-        v = self.msa_proj(m_ln)  # (*, seq, res, heads, c_hidden)
-        b = self.proj_pair_bias(z)  # (*, res, res, no_heads)
-        g = self.to_gamma(m_ln)  # (*, seq, res, heads, c_hidden)
-        
-        del m_ln
-
-        # Masking and shape wrangling
-        if z_mask is not None:
-            z_mask = z_mask.unsqueeze(-1)  # (*, N_res, N_res, 1)
-            z_mask = self.inf * (z_mask - 1)  # mask before softmax
-            b = b + z_mask
-
-        if msa_mask is not None:
-            v = v * msa_mask.unsqueeze(-1).unsqueeze(-1)
-
-        o = MSAWeightedAveragingFused(v, b, g, self.inf)
-
-        # Output projection
-        output = self.output_proj(o)  # (*, seq, res, c_msa)
-        return output
-    
-if __name__ == "__main__":
-    os.environ["TRITON_INTERPRET"] = "1"
-    
-    N_seq = 16
-    N_res = 16
-    B = 1
-    C_m = 32
-    C_z = 128
-    C_hidden = 32
-    no_heads = 1
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    
-    m = torch.randn((B, N_seq, N_res, C_m), device=device)
-    z = torch.randn((B, N_res, N_res, C_z), device=device)
-    
-    msa_original = MSAPairWeightedAveraging(
-            c_msa=C_m,
-            c_z=C_z,
-            c_hidden=C_hidden,
-            no_heads=no_heads
-          ).to(device)
-    o_o = msa_original(m, z)
-    
-    msa = MSAPairWeightedAveragingFused(
-            c_msa=C_m,
-            c_z=C_z,
-            c_hidden=C_hidden,
-            no_heads=no_heads
-          ).to(device)
-    
-    o = msa(m, z)
-
-    print(torch.sum(torch.abs(o_o - o)))
