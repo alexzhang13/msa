@@ -119,8 +119,6 @@ class _MSAWeightedAveragingFused(torch.autograd.Function):
             no_heads,
             triton.cdiv(n_res, BLOCK_SIZE_ROW),
         )
-        
-        print('Grid', grid)
 
         MSAFwdFused[grid](
             v, b, g, out, 
