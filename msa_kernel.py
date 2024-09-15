@@ -25,6 +25,7 @@ def nearest_pow2(n: int):
 @triton.jit
 def MSAFwdFused(
     v_si_ptr, b_ij_ptr, g_si_ptr, output_ptr, vw_ptr,
+    logsumexp_ptr,
     C_hidden, N_head,
     C_LEN_POW2: tl.constexpr,
     RES_LEN_POW2: tl.constexpr,
@@ -128,7 +129,17 @@ def MSAFwdFused(
             
             out = g * vw
             tl.store(output_ptr + si_off, out, si_mask)
+            
+            # Store for backwards pass
             tl.store(vw_ptr + si_off, vw, si_mask)
+    
+    # Store logsumexp
+    lse_off = (z_off * RES_LEN * N_head) + \
+            (offs_i[:, None] * N_head) + \
+            (h_off)
+
+    lse_mask = (offs_i < RES_LEN)[:, None]
+    tl.store(logsumexp_ptr + lse_off, (new_row_max - tl.log(l)), lse_mask)
 
 @triton.jit
 def MSABwdFused(
@@ -147,6 +158,7 @@ class _MSAWeightedAveragingFused(torch.autograd.Function):
         # allocate output
         out = torch.empty((n_batches, n_seq, n_res, no_heads * c_hidden), device=g.device, dtype=g.dtype)
         vw = torch.empty((n_batches, n_seq, n_res, no_heads * c_hidden), device=g.device, dtype=g.dtype)
+        logsumexp = torch.empty((n_batches, n_res, 1, no_heads), device=g.device, dtype=g.dtype)
 
         BLOCK_SIZE_ROW = 32
         BLOCK_SIZE_COL = 16
@@ -161,7 +173,7 @@ class _MSAWeightedAveragingFused(torch.autograd.Function):
         )
         
         MSAFwdFused[grid](
-            v, b, g, out, vw,
+            v, b, g, out, vw, logsumexp,
             c_hidden, no_heads,
             c_hidden_pow2, n_res_pow2, 
             n_seq, n_res,
@@ -170,8 +182,11 @@ class _MSAWeightedAveragingFused(torch.autograd.Function):
             BLOCK_SIZE_COL,
         )
         
-        ctx.save_for_backward(vw, b)
+        ctx.save_for_backward(vw, b, g, logsumexp)
+        ctx.n_batches = n_batches
         ctx.no_heads = no_heads
+        ctx.n_seq = n_seq
+        ctx.n_res = n_res
         ctx.c_hidden = c_hidden
         
         return out
@@ -179,14 +194,41 @@ class _MSAWeightedAveragingFused(torch.autograd.Function):
     @staticmethod
     def backward(ctx, do):
         split_heads = nn.Unflatten(dim=-1, unflattened_size=(ctx.no_heads, ctx.c_hidden))
+        vw, b, g, logsumexp = ctx.saved_tensors
         
-        vw, b = ctx.saved_tensors
         assert do.is_contiguous()
         
         # dv, db, dg, dinf
         print('do shape', do.shape)
         print('vw shape', vw.shape)
         print('b shape', b.shape)
-        return split_heads(do), b, split_heads(do * vw)
+        
+        # Can be tuned / different than fwd pass
+        BLOCK_SIZE_ROW = 32
+        BLOCK_SIZE_COL = 16
+        BLOCK_SIZE_SEQ = 16
+        n_res_pow2 = nearest_pow2(ctx.n_res)
+        c_hidden_pow2 = nearest_pow2(ctx.c_hidden)
+        
+        grid = (
+            ctx.n_batches,
+            ctx.no_heads,
+            triton.cdiv(ctx.n_res, BLOCK_SIZE_ROW),
+        )
+        
+        # MSABwdFused[grid]()
+        
+        W = torch.exp(b - logsumexp)
+        
+        dv = split_heads(do) * g
+        
+        print('dv shape', dv.shape)
+        print('W shape', W.shape)
+        
+        # dv = dv @ W
+        db = b
+        dg = F.sigmoid(g) * (1 - F.sigmoid(g)) * split_heads(do * vw)
+        
+        return dv, db, dg
 
 MSAWeightedAveragingFused = _MSAWeightedAveragingFused.apply
