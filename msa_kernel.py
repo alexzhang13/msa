@@ -15,6 +15,8 @@ import triton.language as tl
 
 from utils import flatten_final_dims, Linear, LinearNoBias
 
+INF: tl.constexpr = 1e9
+
 def nearest_pow2(n: int):
     power = math.ceil(math.log2(n))
     next_power_of_two = 2 ** power
@@ -22,8 +24,8 @@ def nearest_pow2(n: int):
 
 @triton.jit
 def MSAFwdFused(
-    v_si_ptr, b_ij_ptr, g_si_ptr, output_ptr,
-    C_hidden, N_head, inf,
+    v_si_ptr, b_ij_ptr, g_si_ptr, output_ptr, vw_ptr,
+    C_hidden, N_head,
     C_LEN_POW2: tl.constexpr,
     RES_LEN_POW2: tl.constexpr,
     SEQ_LEN: tl.constexpr, RES_LEN: tl.constexpr, 
@@ -60,7 +62,7 @@ def MSAFwdFused(
         ij_mask = ((offs_i < RES_LEN)[:, None]) & ((offs_j < RES_LEN)[None, :])
         
         # Load current b's
-        b = tl.load(b_ij_ptr + b_offs, ij_mask, -inf)
+        b = tl.load(b_ij_ptr + b_offs, ij_mask, -INF)
         
         # Compute softmax statistics (to broadcast)
         new_row_max = tl.maximum(tl.max(b, axis=1, keep_dims=True), prev_row_max)
@@ -126,24 +128,31 @@ def MSAFwdFused(
             
             out = g * vw
             tl.store(output_ptr + si_off, out, si_mask)
+            tl.store(vw_ptr + si_off, vw, si_mask)
 
+@triton.jit
+def MSABwdFused(
+    vw_ptr,
+):
+    pass
 
 class _MSAWeightedAveragingFused(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, v, b, g, inf):
+    def forward(ctx, v, b, g):
         """
         Fuse the softmax and linear combination step of MSA.
         """
-        n_batches, n_seq, n_res, no_heads, C_hidden = v.shape
+        n_batches, n_seq, n_res, no_heads, c_hidden = v.shape
         
         # allocate output
-        out = torch.empty((n_batches, n_seq, n_res, no_heads * C_hidden), device=g.device, dtype=g.dtype)
+        out = torch.empty((n_batches, n_seq, n_res, no_heads * c_hidden), device=g.device, dtype=g.dtype)
+        vw = torch.empty((n_batches, n_seq, n_res, no_heads * c_hidden), device=g.device, dtype=g.dtype)
 
         BLOCK_SIZE_ROW = 32
         BLOCK_SIZE_COL = 16
         BLOCK_SIZE_SEQ = 16
         n_res_pow2 = nearest_pow2(n_res)
-        c_hidden_pow2 = nearest_pow2(C_hidden)
+        c_hidden_pow2 = nearest_pow2(c_hidden)
 
         grid = (
             n_batches,
@@ -152,8 +161,8 @@ class _MSAWeightedAveragingFused(torch.autograd.Function):
         )
         
         MSAFwdFused[grid](
-            v, b, g, out,
-            C_hidden, no_heads, inf,
+            v, b, g, out, vw,
+            c_hidden, no_heads,
             c_hidden_pow2, n_res_pow2, 
             n_seq, n_res,
             BLOCK_SIZE_ROW,
@@ -161,10 +170,23 @@ class _MSAWeightedAveragingFused(torch.autograd.Function):
             BLOCK_SIZE_COL,
         )
         
+        ctx.save_for_backward(vw, b)
+        ctx.no_heads = no_heads
+        ctx.c_hidden = c_hidden
+        
         return out
 
     @staticmethod
     def backward(ctx, do):
-        pass
+        split_heads = nn.Unflatten(dim=-1, unflattened_size=(ctx.no_heads, ctx.c_hidden))
+        
+        vw, b = ctx.saved_tensors
+        assert do.is_contiguous()
+        
+        # dv, db, dg, dinf
+        print('do shape', do.shape)
+        print('vw shape', vw.shape)
+        print('b shape', b.shape)
+        return split_heads(do), b, split_heads(do * vw)
 
 MSAWeightedAveragingFused = _MSAWeightedAveragingFused.apply
