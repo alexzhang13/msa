@@ -10,6 +10,24 @@ from functools import partialmethod
 from utils import flatten_final_dims, Linear, LinearNoBias
 from msa_kernel import MSAWeightedAveragingFused
 
+class MSAWeightedAveragingNaive(nn.Module):
+    def __init__(self, no_heads: int, c_hidden: int):
+        super(MSAWeightedAveragingNaive, self).__init__()
+        self.no_heads = no_heads
+        self.c_hidden = c_hidden
+        self.softmax = nn.Softmax(dim=-2)
+    
+    def forward(self, v, b, g, n_seq, n_res):
+        new_v_shape = (v.shape[:-4] + (n_seq, n_res, n_res, self.no_heads, self.c_hidden))
+        v = v.unsqueeze(-4).expand(new_v_shape)  # (*, seq, res, res, heads, c_hidden)
+
+        # Weighted average with gating
+        weights = self.softmax(b)
+        weights = weights.unsqueeze(-4).unsqueeze(-1)  # (*, 1, res, res, heads, 1)
+        o = F.sigmoid(g) * torch.sum(v * weights, dim=-3)  # (*, seq, res, heads, c_hidden)
+        o = flatten_final_dims(o, 2)
+        
+        return o
 
 class MSAPairWeightedAveraging(nn.Module):
     def __init__(
@@ -47,8 +65,10 @@ class MSAPairWeightedAveraging(nn.Module):
 
         # Output projection
         self.output_proj = LinearNoBias(no_heads * c_hidden, c_msa, init='final')
-
-        self.softmax = nn.Softmax(dim=-2)
+        
+        # Naive MSA
+        self.msa = MSAWeightedAveragingNaive(no_heads, c_hidden)
+        
 
     def forward(
             self,
@@ -91,23 +111,12 @@ class MSAPairWeightedAveraging(nn.Module):
             v = v * msa_mask.unsqueeze(-1).unsqueeze(-1)
             
         if use_triton_kernel:
-            o = MSAWeightedAveragingFused(v, b, g, self.inf)
-
-            # Output projection
-            output = self.output_proj(o)  # (*, seq, res, c_msa)
-            
+            o = MSAWeightedAveragingFused(v, b, g)
         else:
-            new_v_shape = (v.shape[:-4] + (n_seq, n_res, n_res, self.no_heads, self.c_hidden))
-            v = v.unsqueeze(-4).expand(new_v_shape)  # (*, seq, res, res, heads, c_hidden)
+            o = self.msa(v, b, g, n_seq, n_res)
 
-            # Weighted average with gating
-            weights = self.softmax(b)
-            weights = weights.unsqueeze(-4).unsqueeze(-1)  # (*, 1, res, res, heads, 1)
-            o = F.sigmoid(g) * torch.sum(v * weights, dim=-3)  # (*, seq, res, heads, c_hidden)
-
-            # Output projection
-            output = self.output_proj(flatten_final_dims(o, 2))  # (*, seq, res, c_hidden * heads)
-        
+        # Output projection
+        output = self.output_proj(o)
         
         return output
     
