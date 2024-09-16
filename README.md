@@ -22,13 +22,13 @@ This module fits into an MSA implementation, but can also be used in isolation.
 ```python
 from msa_kernel import MSAWeightedAveragingFused
 
-B, H, N_seq, N_res, C_hidden = 1, 8, 128, 384, 32
+B, H, N_seq, N_res, C_hidden = 1, 8, 128, 384, 8
 
 v = torch.randn((B, N_seq, N_res, H, C_hidden), dtype=dtype, device="cuda").requires_grad_()
 b = torch.randn((B, N_res, N_res, H), dtype=dtype, device="cuda").requires_grad_()
 g = torch.randn((B, N_seq, N_res, H, C_hidden), dtype=dtype, device="cuda").requires_grad_()
 
-msa = MSAWeightedAveragingFused(H, C_hidden)
+msa = MSAWeightedAveragingFused(v, b, g)
 ...
 out.backward(loss)
 ```
@@ -49,10 +49,11 @@ C_z=128
 C_m=128
 ```
 
+I've also added a notebook `msa_benchmarking.ipynb` for peak memory and runtime analysis.
+
 #### Forward Pass Runtime
 We benchmark the forward pass across `N_res` in increments of 128 until the device runs out of memory.
 ![forward](./results-fwd.png)
-
 Here is a zoomed in version for ease of comparison:
 ![forward-zoom](./results-fwd-small.png)
 
