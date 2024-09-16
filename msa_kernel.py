@@ -274,21 +274,11 @@ class _MSAWeightedAveragingFused(torch.autograd.Function):
         
         # db = (do * G)^T @ V
         C = torch.einsum('brshc,bsRhc->brRhc', torch.transpose(A, dim0=1, dim1=2), v)
-        D = b * (1 - b)
-        # diag = torch.diagonal(C, dim1=1, dim2=2).permute(0, 2, 1).unsqueeze(2)
-        
-        print('C', C.shape)
-        print('D', D.shape)
-        # print('prod', torch.einsum('brRh,bRlh->brlh', b, torch.transpose(C, dim0=1, dim1=2)).shape)
-        
-        Wvt = torch.einsum('brRh,bRshc->brshc', b, torch.transpose(v, dim0=1, dim1=2))
-        WCt = torch.einsum('brRh,bRlhc->brlhc', b, torch.transpose(C, dim0=1, dim1=2))
-        test = torch.einsum('brRhc,brRh->brRhc', C, b)
-        # E = b * (WCt - diag * b) 
-        # Aw = torch.einsum('brRh,bRlh->brlh', C, b)
+        A_vwT = A * torch.einsum('bsrhc,brRh->bsRhc', v, torch.transpose(b, dim0=1, dim1=2))
+        A_vwT = torch.sum(A_vwT, 1).unsqueeze(2)
         
         # C * D - E
-        db = b * torch.sum((C - WCt), -1)
+        db = b * torch.sum((C - A_vwT), -1)
         
         # dg = G * (1 - G) * (do * vw)
         dg = G * (1 - G) * split_heads(do * vw)
