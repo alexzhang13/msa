@@ -73,10 +73,6 @@ def MSAFwdFused(
         w = tl.exp2(log2_e * (b - new_row_max))
         l *= tl.exp2(log2_e * (prev_row_max - new_row_max))
         l += tl.sum(w, axis=1, keep_dims=True)
-        
-        # w = tl.exp(b)
-        # l += tl.sum(w, axis=1, keep_dims=True)
-        # tl.device_print(tl.sum(w, axis=1, keep_dims=True).shape)
     
         # Compute vw portion
         for s in range(0, SEQ_LEN, BLOCK_SIZE_SEQ):
