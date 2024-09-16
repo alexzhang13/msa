@@ -1,4 +1,4 @@
-# Fast MSA Pair Weighted Averaging with Gating
+# Fast MSA Pair Weighted Averaging with Gating for AlphaFold3 🧬
 This is a Triton implementation of MSA Pair Weighted Averaging with Gating for the Ligo Biosciences [AlphaFold3 open-source implementation](https://github.com/Ligo-Biosciences/AlphaFold3)!
  
 The [original implementation](https://github.com/Ligo-Biosciences/AlphaFold3/blob/main/src/models/msa_module.py) has significant memory bottleneck and is memory-bound due to the softmax + weighting mechanism implementation. Here, we fuse both parts to remove extra broadcasting steps and loads.
