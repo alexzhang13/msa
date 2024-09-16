@@ -48,7 +48,6 @@ def test_correctness(B, H, N_seq, N_res, C_m, C_z, C_hidden, dtype=torch.float32
     tri_out_kernel = MSAWeightedAveragingFused(v, b, g)
     
     dout = torch.randn_like(ref_out_kernel)
-    print('dout shape', dout.shape)
     
     ref_out_kernel.backward(dout)
     ref_dv, v.grad = v.grad.clone(), None
@@ -77,7 +76,7 @@ for mode in ["fwd", "bwd"]:
     configs.append(
         triton.testing.Benchmark(
             x_names=["N_res"],
-            x_vals=[32, 64, 128, 256, 384, 512], # 384, 768, 1536, 3072
+            x_vals=[32, 64] + [128 * (k+1) for k in range(50)], # 384, 768, 1536, 3072
             line_arg="provider",
             line_vals=["triton_msa"] + ["baseline"],
             line_names=["Triton_msa"] + ["Baseline"],
@@ -113,20 +112,24 @@ def bench_msa(BATCH, N_res, N_HEADS, N_seq, C_HIDDEN, C_m, C_z, mode, provider, 
             no_heads=N_HEADS
           ).to(device)
     
-    if "triton_msa" in provider:
-        fn = lambda: msa.forward(m, z, use_triton_kernel=True)
-        if mode == "bwd":
-            o = fn()
-            do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)
+    try: 
+        if "triton_msa" in provider:
+            fn = lambda: msa.forward(m, z, use_triton_kernel=True)
+            if mode == "bwd":
+                o = fn()
+                do = torch.randn_like(o)
+                fn = lambda: o.backward(do, retain_graph=True)
+
+        elif "baseline" in provider:
+            fn = lambda: msa.forward(m, z, use_triton_kernel=False)
+            if mode == "bwd":
+                o = fn()
+                do = torch.randn_like(o)
+                fn = lambda: o.backward(do, retain_graph=True)
         ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
-    elif "baseline" in provider:
-        fn = lambda: msa.forward(m, z, use_triton_kernel=False)
-        if mode == "bwd":
-            o = fn()
-            do = torch.randn_like(o)
-            fn = lambda: o.backward(do, retain_graph=True)
-        ms = triton.testing.do_bench(fn, warmup=warmup, rep=rep)
+    # CUDA OOM
+    except: 
+        ms = None
 
     return ms
 
