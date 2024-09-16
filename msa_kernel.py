@@ -1,3 +1,5 @@
+# Author: Alex Zhang
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -139,13 +141,56 @@ def MSAFwdFused(
             (h_off)
 
     lse_mask = (offs_i < RES_LEN)[:, None]
-    tl.store(logsumexp_ptr + lse_off, (new_row_max - tl.log(l)), lse_mask)
+    tl.store(logsumexp_ptr + lse_off, (new_row_max + tl.log(l)), lse_mask)
 
 @triton.jit
 def MSABwdFused(
-    vw_ptr,
+    b_ij_ptr, logsumexp_ptr,
+    N_head,
+    RES_LEN: tl.constexpr, 
+    BLOCK_SIZE_ROW: tl.constexpr,
+    BLOCK_SIZE_COL: tl.constexpr,
 ):
-    pass
+    # TODO: Update to fuse more operations more efficiently 
+    
+    # Compute the program ID and starting index
+    pid_zh = tl.program_id(0)
+    pid_i = tl.program_id(1)
+    pid_z = pid_zh // N_head
+    pid_h = pid_zh % N_head
+    
+    # Use exp2 for Triton
+    log2_e = 1.44269504089
+    
+    z_off = pid_z.to(tl.int64)
+    h_off = pid_h.to(tl.int64)
+    i_off = pid_i.to(tl.int64) * BLOCK_SIZE_ROW
+    
+    offs_i = i_off + tl.arange(0, BLOCK_SIZE_ROW)
+    
+    # Load logsumexp
+    lse_off = (z_off * RES_LEN * N_head) + \
+            (offs_i[:, None] * N_head) + \
+            (h_off)
+
+    lse_mask = (offs_i < RES_LEN)[:, None]
+    logsumexp = tl.load(logsumexp_ptr + lse_off, lse_mask, 0)
+    
+    for j in range(0, RES_LEN, BLOCK_SIZE_COL):
+        offs_j = j + tl.arange(0, BLOCK_SIZE_COL)
+        b_offs = (z_off * RES_LEN * RES_LEN * N_head) + \
+                (offs_i[:, None] * RES_LEN * N_head) + \
+                (offs_j[None, :] * N_head) + \
+                (h_off)
+
+        ij_mask = ((offs_i < RES_LEN)[:, None]) & ((offs_j < RES_LEN)[None, :])
+
+        # Load current b's
+        b = tl.load(b_ij_ptr + b_offs, ij_mask, -INF)
+        b = tl.exp2(log2_e * (b - logsumexp))
+        tl.store(b_ij_ptr + b_offs, b, ij_mask)
+        
+    
 
 class _MSAWeightedAveragingFused(torch.autograd.Function):
     @staticmethod
@@ -182,7 +227,7 @@ class _MSAWeightedAveragingFused(torch.autograd.Function):
             BLOCK_SIZE_COL,
         )
         
-        ctx.save_for_backward(vw, b, g, logsumexp)
+        ctx.save_for_backward(vw, v, b, g, logsumexp)
         ctx.n_batches = n_batches
         ctx.no_heads = no_heads
         ctx.n_seq = n_seq
@@ -193,41 +238,60 @@ class _MSAWeightedAveragingFused(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do):
+        """
+        TODO: Currently experiencing some precision issues with the Softmax, but computation
+        otherwise is correct.
+        """
         split_heads = nn.Unflatten(dim=-1, unflattened_size=(ctx.no_heads, ctx.c_hidden))
-        vw, b, g, logsumexp = ctx.saved_tensors
+        vw, v, b, g, logsumexp = ctx.saved_tensors
         
         assert do.is_contiguous()
         
-        # dv, db, dg, dinf
-        print('do shape', do.shape)
-        print('vw shape', vw.shape)
-        print('b shape', b.shape)
-        
         # Can be tuned / different than fwd pass
-        BLOCK_SIZE_ROW = 32
-        BLOCK_SIZE_COL = 16
+        BLOCK_SIZE_ROW = 64
+        BLOCK_SIZE_COL = 64
         BLOCK_SIZE_SEQ = 16
         n_res_pow2 = nearest_pow2(ctx.n_res)
         c_hidden_pow2 = nearest_pow2(ctx.c_hidden)
         
         grid = (
-            ctx.n_batches,
-            ctx.no_heads,
+            ctx.n_batches * ctx.no_heads,
             triton.cdiv(ctx.n_res, BLOCK_SIZE_ROW),
         )
         
-        # MSABwdFused[grid]()
+        # For now, compute softmax(B) and write to B
+        MSABwdFused[grid](
+            b, logsumexp,
+            ctx.no_heads, ctx.n_res,
+            BLOCK_SIZE_ROW,
+            BLOCK_SIZE_COL,
+        )
         
-        W = torch.exp(b - logsumexp)
+        # dv_c = (do * g)_c @ W
+        G = F.sigmoid(g)
+        A = split_heads(do) * G 
+        dv = torch.einsum('bsrhc,brRh->bsRhc', A, b)
         
-        dv = split_heads(do) * g
+        # db = (do * G)^T @ V
+        C = torch.einsum('brshc,bsRhc->brRhc', torch.transpose(A, dim0=1, dim1=2), v)
+        D = b * (1 - b)
+        # diag = torch.diagonal(C, dim1=1, dim2=2).permute(0, 2, 1).unsqueeze(2)
         
-        print('dv shape', dv.shape)
-        print('W shape', W.shape)
+        print('C', C.shape)
+        print('D', D.shape)
+        # print('prod', torch.einsum('brRh,bRlh->brlh', b, torch.transpose(C, dim0=1, dim1=2)).shape)
         
-        # dv = dv @ W
-        db = b
-        dg = F.sigmoid(g) * (1 - F.sigmoid(g)) * split_heads(do * vw)
+        Wvt = torch.einsum('brRh,bRshc->brshc', b, torch.transpose(v, dim0=1, dim1=2))
+        WCt = torch.einsum('brRh,bRlhc->brlhc', b, torch.transpose(C, dim0=1, dim1=2))
+        test = torch.einsum('brRhc,brRh->brRhc', C, b)
+        # E = b * (WCt - diag * b) 
+        # Aw = torch.einsum('brRh,bRlh->brlh', C, b)
+        
+        # C * D - E
+        db = b * torch.sum((C - WCt), -1)
+        
+        # dg = G * (1 - G) * (do * vw)
+        dg = G * (1 - G) * split_heads(do * vw)
         
         return dv, db, dg
 
